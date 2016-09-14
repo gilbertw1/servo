@@ -142,7 +142,7 @@ fn load_for_consumer(load_data: LoadData,
         connector: connector,
     };
 
-    let ui_provider = TFDProvider;
+    let ui_provider = TermProvider;
     match load(&load_data, &ui_provider, &http_state,
                devtools_chan, &factory,
                user_agent, &cancel_listener, swmanager_chan) {
@@ -849,7 +849,7 @@ impl UIProvider for TFDProvider {
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     fn input_username_and_password(&self, prompt: &str) -> (Option<String>, Option<String>) {
         (tinyfiledialogs::input_box(prompt, "Username:", ""),
-        tinyfiledialogs::input_box(prompt, "Password:", ""))
+        tinyfiledialogs::password_box(prompt, "Password:"))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -858,7 +858,21 @@ impl UIProvider for TFDProvider {
     }
 }
 
+
+impl UIProvider for TermProvider {
+    fn input_username_and_password(&self, prompt: &str) -> (Option<String>, Option<String>) {
+        let mut username = String::new();
+        let mut password = String::new();
+        println!("Enter Username:");
+        io::stdin().read_line(&mut username);
+        println!("Enter Password:");
+        io::stdin().read_line(&mut password);
+        (Some(username.trim().to_string()), Some(password.trim().to_string()))
+    }
+}
+
 struct TFDProvider;
+struct TermProvider;
 
 pub fn load<A, B>(load_data: &LoadData,
                   ui_provider: &B,
