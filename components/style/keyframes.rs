@@ -87,7 +87,6 @@ pub struct Keyframe {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
 pub enum KeyframesStepValue {
-    /// See `Keyframe::declarations`’s docs about the presence of `Importance`.
     Declarations(Arc<PropertyDeclarationBlock>),
     ComputedValues,
 }
@@ -268,7 +267,7 @@ impl<'a> QualifiedRuleParser for KeyframeListParser<'a> {
             block: Arc::new(PropertyDeclarationBlock {
                 declarations: declarations,
                 important_count: 0,
-            }),
+            })
         }))
     }
 }

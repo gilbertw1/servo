@@ -327,10 +327,10 @@ impl LayoutElementHelpers for LayoutJS<Element> {
         where V: Push<ApplicableDeclarationBlock>
     {
         #[inline]
-        fn from_declaration(rule: PropertyDeclaration) -> ApplicableDeclarationBlock {
+        fn from_declaration(declaration: PropertyDeclaration) -> ApplicableDeclarationBlock {
             ApplicableDeclarationBlock::from_declarations(
                 Arc::new(PropertyDeclarationBlock {
-                    declarations: vec![(rule, Importance::Normal)],
+                    declarations: vec![(declaration, Importance::Normal)],
                     important_count: 0,
                 }),
                 Importance::Normal)
@@ -736,8 +736,8 @@ impl Element {
     // this sync method is called upon modification of the style_attribute property,
     // therefore, it should not trigger subsequent mutation events
     pub fn sync_property_with_attrs_style(&self) {
-        let style_str = if let &Some(ref declarations) = &*self.style_attribute().borrow() {
-            declarations.to_css_string()
+        let style_str = if let &Some(ref block) = &*self.style_attribute().borrow() {
+            block.to_css_string()
         } else {
             String::new()
         };
@@ -767,9 +767,9 @@ impl Element {
     pub fn remove_inline_style_property(&self, property: &str) {
         fn remove(element: &Element, property: &str) {
             let mut inline_declarations = element.style_attribute.borrow_mut();
-            if let &mut Some(ref mut declarations) = &mut *inline_declarations {
+            if let &mut Some(ref mut block) = &mut *inline_declarations {
                 let mut importance = None;
-                let index = declarations.declarations.iter().position(|&(ref decl, i)| {
+                let index = block.declarations.iter().position(|&(ref decl, i)| {
                     let matching = decl.matches(property);
                     if matching {
                         importance = Some(i)
@@ -777,10 +777,10 @@ impl Element {
                     matching
                 });
                 if let Some(index) = index {
-                    let declarations = Arc::make_mut(declarations);
-                    declarations.declarations.remove(index);
+                    let block = Arc::make_mut(block);
+                    block.declarations.remove(index);
                     if importance.unwrap().important() {
-                        declarations.important_count -= 1;
+                        block.important_count -= 1;
                     }
                 }
             }
@@ -796,22 +796,22 @@ impl Element {
         fn update(element: &Element, declarations: Vec<PropertyDeclaration>,
                   importance: Importance) {
             let mut inline_declarations = element.style_attribute().borrow_mut();
-            if let &mut Some(ref mut declaration_block) = &mut *inline_declarations {
+            if let &mut Some(ref mut block) = &mut *inline_declarations {
                 {
                     // Usually, the reference count will be 1 here. But transitions could make it greater
                     // than that.
-                    let declaration_block = Arc::make_mut(declaration_block);
-                    let existing_declarations = &mut declaration_block.declarations;
+                    let block = Arc::make_mut(block);
+                    let existing_declarations = &mut block.declarations;
 
                     'outer: for incoming_declaration in declarations {
                         for existing_declaration in &mut *existing_declarations {
                             if existing_declaration.0.name() == incoming_declaration.name() {
                                 match (existing_declaration.1, importance) {
                                     (Importance::Normal, Importance::Important) => {
-                                        declaration_block.important_count += 1;
+                                        block.important_count += 1;
                                     }
                                     (Importance::Important, Importance::Normal) => {
-                                        declaration_block.important_count -= 1;
+                                        block.important_count -= 1;
                                     }
                                     _ => {}
                                 }
@@ -821,7 +821,7 @@ impl Element {
                         }
                         existing_declarations.push((incoming_declaration, importance));
                         if importance.important() {
-                            declaration_block.important_count += 1;
+                            block.important_count += 1;
                         }
                     }
                 }
@@ -877,11 +877,11 @@ impl Element {
     pub fn get_inline_style_declaration(&self,
                                         property: &Atom)
                                         -> Option<Ref<(PropertyDeclaration, Importance)>> {
-        Ref::filter_map(self.style_attribute.borrow(), |inline_declarations| {
-            inline_declarations.as_ref().and_then(|declarations| {
-                declarations.declarations
-                            .iter()
-                            .find(|&&(ref decl, _)| decl.matches(&property))
+        Ref::filter_map(self.style_attribute.borrow(), |block| {
+            block.as_ref().and_then(|block| {
+                block.declarations
+                     .iter()
+                     .find(|&&(ref decl, _)| decl.matches(&property))
             })
         })
     }
@@ -2108,11 +2108,10 @@ impl VirtualMethods for Element {
                 *self.style_attribute.borrow_mut() =
                     mutation.new_value(attr).map(|value| {
                         let win = window_from_node(self);
-                        Arc::new(parse_style_attribute(
-                            &value,
-                            &doc.base_url(),
-                            win.css_error_reporter(),
-                            ParserContextExtraData::default()))
+                        Arc::new(parse_style_attribute(&value,
+                                                       &doc.base_url(),
+                                                       win.css_error_reporter(),
+                                                       ParserContextExtraData::default()))
                     });
                 if node.is_in_doc() {
                     node.dirty(NodeDamage::NodeStyleDamaged);

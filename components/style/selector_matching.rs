@@ -12,6 +12,7 @@ use media_queries::{Device, MediaType};
 use properties::{self, PropertyDeclaration, PropertyDeclarationBlock, ComputedValues, Importance};
 use quickersort::sort_by;
 use restyle_hints::{RestyleHint, DependencySet};
+use rule_tree::{RuleTree, StrongRuleNode, StyleSource};
 use selector_impl::{ElementExt, TheSelectorImpl, PseudoElement};
 use selectors::Element;
 use selectors::bloom::BloomFilter;
@@ -29,7 +30,7 @@ use std::slice;
 use std::sync::Arc;
 use string_cache::Atom;
 use style_traits::viewport::ViewportConstraints;
-use stylesheets::{CSSRule, CSSRuleIteratorExt, Origin, Stylesheet, UserAgentStylesheets};
+use stylesheets::{CSSRule, CSSRuleIteratorExt, Origin, Stylesheet, StyleRule, UserAgentStylesheets};
 use viewport::{MaybeNew, ViewportRuleCascade};
 
 pub type FnvHashMap<K, V> = HashMap<K, V, BuildHasherDefault<::fnv::FnvHasher>>;
@@ -60,6 +61,11 @@ pub struct Stylist {
     /// rules against the current device.
     element_map: PerPseudoElementSelectorMap,
 
+    /// The rule tree, that stores the results of selector matching.
+    ///
+    /// FIXME(emilio): Not `pub`!
+    pub rule_tree: RuleTree,
+
     /// The selector maps corresponding to a given pseudo-element
     /// (depending on the implementation)
     pseudos_map: FnvHashMap<PseudoElement, PerPseudoElementSelectorMap>,
@@ -70,6 +76,8 @@ pub struct Stylist {
     /// Applicable declarations for a given non-eagerly cascaded pseudo-element.
     /// These are eagerly computed once, and then used to resolve the new
     /// computed values on the fly on layout.
+    ///
+    /// FIXME(emilio): Use the rule tree!
     precomputed_pseudo_element_decls: FnvHashMap<PseudoElement, Vec<ApplicableDeclarationBlock>>,
 
     rules_source_order: usize,
@@ -99,6 +107,7 @@ impl Stylist {
             animations: Default::default(),
             precomputed_pseudo_element_decls: Default::default(),
             rules_source_order: 0,
+            rule_tree: RuleTree::new(),
             state_deps: DependencySet::new(),
 
             // XXX remember resetting them!
@@ -159,8 +168,8 @@ impl Stylist {
         if !stylesheet.is_effective_for_device(&self.device) {
             return;
         }
-        let mut rules_source_order = self.rules_source_order;
 
+        let mut rules_source_order = self.rules_source_order;
         for rule in stylesheet.effective_rules(&self.device) {
             match *rule {
                 CSSRule::Style(ref style_rule) => {
@@ -176,7 +185,7 @@ impl Stylist {
 
                         map.insert(Rule {
                             selector: selector.complex_selector.clone(),
-                            declarations: style_rule.declarations.clone(),
+                            style_rule: style_rule.clone(),
                             specificity: selector.specificity,
                             source_order: rules_source_order,
                         });
@@ -241,19 +250,22 @@ impl Stylist {
     pub fn precomputed_values_for_pseudo(&self,
                                          pseudo: &PseudoElement,
                                          parent: Option<&Arc<ComputedValues>>)
-                                         -> Option<Arc<ComputedValues>> {
+                                         -> Option<(Arc<ComputedValues>, StrongRuleNode)> {
         debug_assert!(TheSelectorImpl::pseudo_element_cascade_type(pseudo).is_precomputed());
         if let Some(declarations) = self.precomputed_pseudo_element_decls.get(pseudo) {
-            let (computed, _) =
+            // FIXME(emilio): When we've taken rid of the cascade we can just
+            // use into_iter.
+            let rule_node =
+                self.rule_tree.insert_ordered_rules(declarations.iter().map(|a| (a.source.clone(), a.importance)));
+            let computed =
                 properties::cascade(self.device.au_viewport_size(),
-                                    &declarations, false,
+                                    &rule_node, false,
                                     parent.map(|p| &**p),
                                     None,
-                                    None,
                                     Box::new(StdoutErrorReporter));
-            Some(Arc::new(computed))
+            Some((Arc::new(computed), rule_node))
         } else {
-            parent.map(|p| p.clone())
+            parent.map(|p| (p.clone(), self.rule_tree.root()))
         }
     }
 
@@ -261,7 +273,7 @@ impl Stylist {
                                                   element: &E,
                                                   pseudo: &PseudoElement,
                                                   parent: &Arc<ComputedValues>)
-                                                  -> Option<Arc<ComputedValues>>
+                                                  -> Option<(Arc<ComputedValues>, StrongRuleNode)>
         where E: Element<Impl=TheSelectorImpl> +
               fmt::Debug +
               PresentationalHintsSynthetizer
@@ -273,8 +285,6 @@ impl Stylist {
 
         let mut declarations = vec![];
 
-        // NB: This being cached could be worth it, maybe allow an optional
-        // ApplicableDeclarationsCache?.
         self.push_applicable_declarations(element,
                                           None,
                                           None,
@@ -282,14 +292,17 @@ impl Stylist {
                                           &mut declarations,
                                           MatchingReason::ForStyling);
 
-        let (computed, _) =
+        let rule_node =
+            self.rule_tree.insert_ordered_rules(declarations.into_iter().map(|a| (a.source.clone(), a.importance)));
+
+        let computed =
             properties::cascade(self.device.au_viewport_size(),
-                                &declarations, false,
-                                Some(&**parent), None, None,
+                                &rule_node, false,
+                                Some(&**parent), None,
                                 Box::new(StdoutErrorReporter));
 
 
-        Some(Arc::new(computed))
+        Some((Arc::new(computed), rule_node))
     }
 
     pub fn set_device(&mut self, mut device: Device, stylesheets: &[Arc<Stylesheet>]) {
@@ -338,9 +351,9 @@ impl Stylist {
                  PresentationalHintsSynthetizer,
               V: Push<ApplicableDeclarationBlock> + VecLike<ApplicableDeclarationBlock>
     {
-        assert!(!self.is_device_dirty);
-        assert!(style_attribute.is_none() || pseudo_element.is_none(),
-                "Style attributes do not apply to pseudo-elements");
+        debug_assert!(!self.is_device_dirty);
+        debug_assert!(style_attribute.is_none() || pseudo_element.is_none(),
+                      "Style attributes do not apply to pseudo-elements");
         debug_assert!(pseudo_element.is_none() ||
                       !TheSelectorImpl::pseudo_element_cascade_type(pseudo_element.as_ref().unwrap())
                         .is_precomputed());
@@ -684,7 +697,7 @@ impl SelectorMap {
 
         // Sort only the rules we just added.
         sort_by_key(&mut matching_rules_list[init_len..],
-                    |rule| (rule.specificity, rule.source_order));
+                    |block| (block.specificity, block.source_order));
     }
 
     /// Append to `rule_list` all universal Rules (rules with selector `*|*`) in
@@ -702,19 +715,27 @@ impl SelectorMap {
         for rule in self.other_rules.iter() {
             if rule.selector.compound_selector.is_empty() &&
                rule.selector.next.is_none() {
-                if rule.declarations.any_normal() {
-                    matching_rules_list.push(
-                        rule.to_applicable_declaration_block(Importance::Normal));
+                if rule.style_rule.block.any_normal() {
+                    matching_rules_list.push(ApplicableDeclarationBlock {
+                        source: StyleSource::Style(rule.style_rule.clone()),
+                        importance: Importance::Normal,
+                        source_order: rule.source_order,
+                        specificity: rule.specificity,
+                    })
                 }
-                if rule.declarations.any_important() {
-                    matching_rules_list.push(
-                        rule.to_applicable_declaration_block(Importance::Important));
+                if rule.style_rule.block.any_important() {
+                    matching_rules_list.push(ApplicableDeclarationBlock {
+                        source: StyleSource::Style(rule.style_rule.clone()),
+                        importance: Importance::Important,
+                        source_order: rule.source_order,
+                        specificity: rule.specificity,
+                    })
                 }
             }
         }
 
         sort_by_key(&mut matching_rules_list[init_len..],
-                    |rule| (rule.specificity, rule.source_order));
+                    |block| (block.specificity, block.source_order));
     }
 
     fn get_matching_rules_from_hash<E, Str, BorrowedStr: ?Sized, Vector>(
@@ -754,7 +775,7 @@ impl SelectorMap {
               V: VecLike<ApplicableDeclarationBlock>
     {
         for rule in rules.iter() {
-            let block = &rule.declarations;
+            let block = &rule.style_rule.block;
             let any_declaration_for_importance = if importance.important() {
                 block.any_important()
             } else {
@@ -763,7 +784,12 @@ impl SelectorMap {
             if any_declaration_for_importance &&
                matches_complex_selector(&*rule.selector, element, parent_bf,
                                         relations, reason) {
-                matching_rules.push(rule.to_applicable_declaration_block(importance));
+                matching_rules.push(ApplicableDeclarationBlock {
+                    source: StyleSource::Style(rule.style_rule.clone()),
+                    importance: importance,
+                    source_order: rule.source_order,
+                    specificity: rule.specificity,
+                })
             }
         }
     }
@@ -834,27 +860,15 @@ impl SelectorMap {
 }
 
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Rule {
     // This is an Arc because Rule will essentially be cloned for every element
     // that it matches. Selector contains an owned vector (through
     // ComplexSelector) and we want to avoid the allocation.
     pub selector: Arc<ComplexSelector<TheSelectorImpl>>,
-    pub declarations: Arc<PropertyDeclarationBlock>,
+    pub style_rule: Arc<StyleRule>,
     pub source_order: usize,
     pub specificity: u32,
-}
-
-impl Rule {
-    fn to_applicable_declaration_block(&self, importance: Importance)
-                                       -> ApplicableDeclarationBlock {
-        ApplicableDeclarationBlock {
-            mixed_declarations: self.declarations.clone(),
-            importance: importance,
-            source_order: self.source_order,
-            specificity: self.specificity,
-        }
-    }
 }
 
 /// A property declaration together with its precedence among rules of equal specificity so that
@@ -862,9 +876,7 @@ impl Rule {
 #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
 #[derive(Debug, Clone)]
 pub struct ApplicableDeclarationBlock {
-    /// Contains declarations of either importance, but only those of self.importance are relevant.
-    /// Use ApplicableDeclarationBlock::iter
-    pub mixed_declarations: Arc<PropertyDeclarationBlock>,
+    pub source: StyleSource,
     pub importance: Importance,
     pub source_order: usize,
     pub specificity: u32,
@@ -873,19 +885,18 @@ pub struct ApplicableDeclarationBlock {
 impl ApplicableDeclarationBlock {
     #[inline]
     pub fn from_declarations(declarations: Arc<PropertyDeclarationBlock>,
-                             importance: Importance)
-                             -> Self {
+                             importance: Importance) -> Self {
         ApplicableDeclarationBlock {
-            mixed_declarations: declarations,
-            importance: importance,
+            source: StyleSource::Declarations(declarations),
             source_order: 0,
             specificity: 0,
+            importance: importance,
         }
     }
 
     pub fn iter(&self) -> ApplicableDeclarationBlockIter {
         ApplicableDeclarationBlockIter {
-            iter: self.mixed_declarations.declarations.iter(),
+            iter: self.source.declaration_block().declarations.iter(),
             importance: self.importance,
         }
     }
@@ -922,6 +933,8 @@ impl<'a> DoubleEndedIterator for ApplicableDeclarationBlockIter<'a> {
     }
 }
 
-fn find_push<Str: Eq + Hash>(map: &mut FnvHashMap<Str, Vec<Rule>>, key: Str, value: Rule) {
+#[inline]
+fn find_push<Str: Eq + Hash>(map: &mut FnvHashMap<Str, Vec<Rule>>, key: Str,
+                             value: Rule) {
     map.entry(key).or_insert_with(Vec::new).push(value)
 }

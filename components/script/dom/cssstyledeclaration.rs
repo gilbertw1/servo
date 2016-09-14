@@ -93,7 +93,7 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
     fn Length(&self) -> u32 {
         let elem = self.owner.upcast::<Element>();
         let len = match *elem.style_attribute().borrow() {
-            Some(ref declarations) => declarations.declarations.len(),
+            Some(ref block) => block.declarations.len(),
             None => 0,
         };
         len as u32
@@ -327,8 +327,8 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
         let index = index as usize;
         let elem = self.owner.upcast::<Element>();
         let style_attribute = elem.style_attribute().borrow();
-        style_attribute.as_ref().and_then(|declarations| {
-            declarations.declarations.get(index)
+        style_attribute.as_ref().and_then(|block| {
+            block.declarations.get(index)
         }).map(|&(ref declaration, importance)| {
             let mut css = declaration.to_css_string();
             if importance.important() {
@@ -343,8 +343,8 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
         let elem = self.owner.upcast::<Element>();
         let style_attribute = elem.style_attribute().borrow();
 
-        if let Some(declarations) = style_attribute.as_ref() {
-            DOMString::from(declarations.to_css_string())
+        if let Some(block) = style_attribute.as_ref() {
+            DOMString::from(block.to_css_string())
         } else {
             DOMString::new()
         }

@@ -8,22 +8,22 @@
 
 use animation;
 use arc_ptr_eq;
-use cache::{LRUCache, SimpleHashCache};
+use cache::LRUCache;
 use cascade_info::CascadeInfo;
 use context::{SharedStyleContext, StyleContext};
 use data::PrivateStyleData;
 use dom::{TElement, TNode, TRestyleDamage, UnsafeNode};
-use properties::{ComputedValues, PropertyDeclarationBlock, cascade};
+use properties::{ComputedValues, cascade};
 use properties::longhands::display::computed_value as display;
-use selector_impl::{PseudoElement, TheSelectorImpl};
+use rule_tree::StrongRuleNode;
+use selector_impl::{TheSelectorImpl, PseudoElement};
 use selector_matching::{ApplicableDeclarationBlock, Stylist};
 use selectors::{Element, MatchAttr};
 use selectors::bloom::BloomFilter;
 use selectors::matching::{AFFECTED_BY_PSEUDO_ELEMENTS, MatchingReason, StyleRelations};
 use sink::ForgetfulSink;
-use smallvec::SmallVec;
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::BuildHasherDefault;
 use std::slice::IterMut;
 use std::sync::Arc;
 use string_cache::Atom;
@@ -51,7 +51,7 @@ fn create_common_style_affecting_attributes_from_element<E: TElement>(element: &
 }
 
 pub struct ApplicableDeclarations {
-    pub normal: SmallVec<[ApplicableDeclarationBlock; 16]>,
+    pub normal: Vec<ApplicableDeclarationBlock>,
     pub per_pseudo: HashMap<PseudoElement,
                             Vec<ApplicableDeclarationBlock>,
                             BuildHasherDefault<::fnv::FnvHasher>>,
@@ -63,7 +63,7 @@ pub struct ApplicableDeclarations {
 impl ApplicableDeclarations {
     pub fn new() -> Self {
         let mut applicable_declarations = ApplicableDeclarations {
-            normal: SmallVec::new(),
+            normal: Vec::with_capacity(16),
             per_pseudo: HashMap::with_hasher(Default::default()),
             normal_shareable: false,
         };
@@ -73,105 +73,6 @@ impl ApplicableDeclarations {
         });
 
         applicable_declarations
-    }
-}
-
-#[derive(Clone)]
-pub struct ApplicableDeclarationsCacheEntry {
-    pub declarations: Vec<ApplicableDeclarationBlock>,
-}
-
-impl ApplicableDeclarationsCacheEntry {
-    fn new(declarations: Vec<ApplicableDeclarationBlock>) -> ApplicableDeclarationsCacheEntry {
-        ApplicableDeclarationsCacheEntry {
-            declarations: declarations,
-        }
-    }
-}
-
-impl PartialEq for ApplicableDeclarationsCacheEntry {
-    fn eq(&self, other: &ApplicableDeclarationsCacheEntry) -> bool {
-        let this_as_query = ApplicableDeclarationsCacheQuery::new(&*self.declarations);
-        this_as_query.eq(other)
-    }
-}
-impl Eq for ApplicableDeclarationsCacheEntry {}
-
-impl Hash for ApplicableDeclarationsCacheEntry {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let tmp = ApplicableDeclarationsCacheQuery::new(&*self.declarations);
-        tmp.hash(state);
-    }
-}
-
-struct ApplicableDeclarationsCacheQuery<'a> {
-    declarations: &'a [ApplicableDeclarationBlock],
-}
-
-impl<'a> ApplicableDeclarationsCacheQuery<'a> {
-    fn new(declarations: &'a [ApplicableDeclarationBlock]) -> ApplicableDeclarationsCacheQuery<'a> {
-        ApplicableDeclarationsCacheQuery {
-            declarations: declarations,
-        }
-    }
-}
-
-impl<'a> PartialEq for ApplicableDeclarationsCacheQuery<'a> {
-    fn eq(&self, other: &ApplicableDeclarationsCacheQuery<'a>) -> bool {
-        self.declarations.len() == other.declarations.len() &&
-        self.declarations.iter().zip(other.declarations).all(|(this, other)| {
-            arc_ptr_eq(&this.mixed_declarations, &other.mixed_declarations) &&
-            this.importance == other.importance
-        })
-    }
-}
-impl<'a> Eq for ApplicableDeclarationsCacheQuery<'a> {}
-
-impl<'a> PartialEq<ApplicableDeclarationsCacheEntry> for ApplicableDeclarationsCacheQuery<'a> {
-    fn eq(&self, other: &ApplicableDeclarationsCacheEntry) -> bool {
-        let other_as_query = ApplicableDeclarationsCacheQuery::new(&other.declarations);
-        self.eq(&other_as_query)
-    }
-}
-
-impl<'a> Hash for ApplicableDeclarationsCacheQuery<'a> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        for declaration in self.declarations {
-            // Each declaration contians an Arc, which is a stable
-            // pointer; we use that for hashing and equality.
-            let ptr: *const PropertyDeclarationBlock = &*declaration.mixed_declarations;
-            ptr.hash(state);
-            declaration.importance.hash(state);
-        }
-    }
-}
-
-static APPLICABLE_DECLARATIONS_CACHE_SIZE: usize = 32;
-
-pub struct ApplicableDeclarationsCache {
-    cache: SimpleHashCache<ApplicableDeclarationsCacheEntry, Arc<ComputedValues>>,
-}
-
-impl ApplicableDeclarationsCache {
-    pub fn new() -> Self {
-        ApplicableDeclarationsCache {
-            cache: SimpleHashCache::new(APPLICABLE_DECLARATIONS_CACHE_SIZE),
-        }
-    }
-
-    pub fn find(&self, declarations: &[ApplicableDeclarationBlock]) -> Option<Arc<ComputedValues>> {
-        match self.cache.find(&ApplicableDeclarationsCacheQuery::new(declarations)) {
-            None => None,
-            Some(ref values) => Some((*values).clone()),
-        }
-    }
-
-    pub fn insert(&mut self, declarations: Vec<ApplicableDeclarationBlock>, style: Arc<ComputedValues>) {
-        self.cache.insert(ApplicableDeclarationsCacheEntry::new(declarations), style)
-    }
-
-    pub fn evict_all(&mut self) {
-        self.cache.evict_all();
     }
 }
 
@@ -493,44 +394,38 @@ trait PrivateMatchMethods: TNode {
     fn cascade_node_pseudo_element<'a, Ctx>(&self,
                                             context: &Ctx,
                                             parent_style: Option<&Arc<ComputedValues>>,
-                                            applicable_declarations: &[ApplicableDeclarationBlock],
+                                            applicable_declarations: &mut Vec<ApplicableDeclarationBlock>,
                                             mut old_style: Option<&mut Arc<ComputedValues>>,
-                                            applicable_declarations_cache:
-                                             &mut ApplicableDeclarationsCache,
                                             shareable: bool,
                                             animate_properties: bool)
-                                            -> Arc<ComputedValues>
+                                            -> (Arc<ComputedValues>, StrongRuleNode)
         where Ctx: StyleContext<'a>
     {
-        let mut cacheable = true;
         let shared_context = context.shared_context();
         if animate_properties {
-            cacheable = !self.update_animations_for_cascade(shared_context,
-                                                            &mut old_style) && cacheable;
+            self.update_animations_for_cascade(shared_context,
+                                               &mut old_style);
         }
 
-        let mut cascade_info = CascadeInfo::new();
-        let (this_style, is_cacheable) = match parent_style {
-            Some(ref parent_style) => {
-                let cache_entry = applicable_declarations_cache.find(applicable_declarations);
-                let cached_computed_values = match cache_entry {
-                    Some(ref style) => Some(&**style),
-                    None => None,
-                };
+        let rule_node =
+            shared_context.stylist.rule_tree
+                          .insert_ordered_rules(
+                              applicable_declarations.drain(..).map(|d| (d.source, d.importance)));
 
+        let mut cascade_info = CascadeInfo::new();
+        let this_style = match parent_style {
+            Some(ref parent_style) => {
                 cascade(shared_context.viewport_size,
-                        applicable_declarations,
+                        &rule_node,
                         shareable,
                         Some(&***parent_style),
-                        cached_computed_values,
                         Some(&mut cascade_info),
                         shared_context.error_reporter.clone())
             }
             None => {
                 cascade(shared_context.viewport_size,
-                        applicable_declarations,
+                        &rule_node,
                         shareable,
-                        None,
                         None,
                         Some(&mut cascade_info),
                         shared_context.error_reporter.clone())
@@ -538,42 +433,28 @@ trait PrivateMatchMethods: TNode {
         };
         cascade_info.finish(self);
 
-        cacheable = cacheable && is_cacheable;
-
         let mut this_style = Arc::new(this_style);
 
         if animate_properties {
             let new_animations_sender = &context.local_context().new_animations_sender;
             let this_opaque = self.opaque();
             // Trigger any present animations if necessary.
-            let mut animations_started = animation::maybe_start_animations(
-                &shared_context,
-                new_animations_sender,
-                this_opaque,
-                &this_style);
+            animation::maybe_start_animations(&shared_context,
+                                              new_animations_sender,
+                                              this_opaque, &this_style);
 
             // Trigger transitions if necessary. This will reset `this_style` back
             // to its old value if it did trigger a transition.
             if let Some(ref style) = old_style {
-                animations_started |=
-                    animation::start_transitions_if_applicable(
-                        new_animations_sender,
-                        this_opaque,
-                        &**style,
-                        &mut this_style,
-                        &shared_context.timer);
+                animation::start_transitions_if_applicable(new_animations_sender,
+                                                           this_opaque,
+                                                           &**style,
+                                                           &mut this_style,
+                                                           &shared_context.timer);
             }
-
-            cacheable = cacheable && !animations_started
         }
 
-        // Cache the resolved style if it was cacheable.
-        if cacheable {
-            applicable_declarations_cache.insert(applicable_declarations.to_vec(),
-                                                 this_style.clone());
-        }
-
-        this_style
+        (this_style, rule_node)
     }
 
     fn update_animations_for_cascade(&self,
@@ -648,9 +529,10 @@ pub trait ElementMatchMethods : TElement {
     fn match_element(&self,
                      stylist: &Stylist,
                      parent_bf: Option<&BloomFilter>,
-                     applicable_declarations: &mut ApplicableDeclarations)
+                     mut applicable_declarations: &mut ApplicableDeclarations)
                      -> StyleRelations {
         use traversal::relations_are_shareable;
+
         let style_attribute = self.style_attribute();
 
         let mut relations =
@@ -861,7 +743,7 @@ pub trait MatchMethods : TNode {
     unsafe fn cascade_node<'a, Ctx>(&self,
                                     context: &Ctx,
                                     parent: Option<Self>,
-                                    applicable_declarations: &ApplicableDeclarations)
+                                    mut applicable_declarations: ApplicableDeclarations)
                                     -> RestyleResult
         where Ctx: StyleContext<'a>
     {
@@ -897,26 +779,22 @@ pub trait MatchMethods : TNode {
             return RestyleResult::Continue;
         }
 
-        let mut applicable_declarations_cache =
-            context.local_context().applicable_declarations_cache.borrow_mut();
-
         let (damage, restyle_result) = {
             let mut data_ref = self.mutate_data().unwrap();
             let mut data = &mut *data_ref;
-            let final_style =
+            let (final_style, rule_node) =
                 self.cascade_node_pseudo_element(context, parent_style,
-                                                 &applicable_declarations.normal,
+                                                 &mut applicable_declarations.normal,
                                                  data.style.as_mut(),
-                                                 &mut applicable_declarations_cache,
                                                  applicable_declarations.normal_shareable,
                                                  /* should_animate = */ true);
 
             let (damage, restyle_result) =
                 self.compute_damage_and_cascade_pseudos(final_style,
+                                                        rule_node,
                                                         data,
                                                         context,
-                                                        applicable_declarations,
-                                                        &mut applicable_declarations_cache);
+                                                        &mut applicable_declarations);
 
             self.set_can_be_fragmented(parent.map_or(false, |p| {
                 p.can_be_fragmented() ||
@@ -936,10 +814,10 @@ pub trait MatchMethods : TNode {
 
     fn compute_damage_and_cascade_pseudos<'a, Ctx>(&self,
                                                    final_style: Arc<ComputedValues>,
+                                                   rule_node: StrongRuleNode,
                                                    data: &mut PrivateStyleData,
                                                    context: &Ctx,
-                                                   applicable_declarations: &ApplicableDeclarations,
-                                                   mut applicable_declarations_cache: &mut ApplicableDeclarationsCache)
+                                                   applicable_declarations: &mut ApplicableDeclarations)
                                                    -> (Self::ConcreteRestyleDamage, RestyleResult)
         where Ctx: StyleContext<'a>
     {
@@ -975,6 +853,7 @@ pub trait MatchMethods : TNode {
             self.compute_restyle_damage(data.style.as_ref(), &final_style, None);
 
         data.style = Some(final_style);
+        data.rule_node = Some(rule_node);
 
         let data_per_pseudo = &mut data.per_pseudo;
         let new_style = data.style.as_ref();
@@ -987,8 +866,8 @@ pub trait MatchMethods : TNode {
         <Self::ConcreteElement as MatchAttr>::Impl::each_eagerly_cascaded_pseudo_element(|pseudo| {
             use std::collections::hash_map::Entry;
 
-            let applicable_declarations_for_this_pseudo =
-                applicable_declarations.per_pseudo.get(&pseudo).unwrap();
+            let mut applicable_declarations_for_this_pseudo =
+                applicable_declarations.per_pseudo.get_mut(&pseudo).unwrap();
 
             let has_declarations =
                 !applicable_declarations_for_this_pseudo.is_empty();
@@ -996,17 +875,20 @@ pub trait MatchMethods : TNode {
             // If there are declarations matching, we're going to need to
             // recompute the style anyway, so do it now to simplify the logic
             // below.
-            let pseudo_style_if_declarations = if has_declarations {
+            let mut pseudo_style_and_rule_node_if_declarations = if has_declarations {
                 // NB: Transitions and animations should only work for
                 // pseudo-elements ::before and ::after
                 let should_animate_properties =
                     <Self::ConcreteElement as MatchAttr>::Impl::pseudo_is_before_or_after(&pseudo);
 
+                let old_style_and_rule_node = data_per_pseudo.get_mut(&pseudo);
+                let old_style =
+                    old_style_and_rule_node.map(|&mut (ref mut s, _)| s);
+
                 Some(self.cascade_node_pseudo_element(context,
                                                       new_style,
-                                                      &*applicable_declarations_for_this_pseudo,
-                                                      data_per_pseudo.get_mut(&pseudo),
-                                                      &mut applicable_declarations_cache,
+                                                      &mut applicable_declarations_for_this_pseudo,
+                                                      old_style,
                                                       /* shareable = */ false,
                                                       should_animate_properties))
             } else {
@@ -1025,7 +907,7 @@ pub trait MatchMethods : TNode {
                     // Otherwise, we need to insert the new computed styles, and
                     // generate a rebuild_and_reflow damage.
                     damage = damage | Self::ConcreteRestyleDamage::rebuild_and_reflow();
-                    vacant_entry.insert(pseudo_style_if_declarations.unwrap());
+                    vacant_entry.insert(pseudo_style_and_rule_node_if_declarations.unwrap());
                 }
                 Entry::Occupied(mut occupied_entry) => {
                     // If there was an existing style, and no declarations, we
@@ -1037,18 +919,25 @@ pub trait MatchMethods : TNode {
                         return;
                     }
 
-                    // If there's a new style, we need to diff it and add the
-                    // damage, except if the damage was already
-                    // rebuild_and_reflow, in which case we can avoid it.
-                    if damage != rebuild_and_reflow {
-                        damage = damage |
-                                 self.compute_restyle_damage(Some(occupied_entry.get()),
-                                                             pseudo_style_if_declarations.as_ref().unwrap(),
-                                                             Some(&pseudo));
+                    {
+                        let (ref old_style, ref _old_rule_node) = *occupied_entry.get();
+
+                        // If there's a new style, we need to diff it and add the
+                        // damage, except if the damage was already
+                        // rebuild_and_reflow, in which case we can avoid it.
+                        if damage != rebuild_and_reflow {
+                            let pseudo_style =
+                                &mut pseudo_style_and_rule_node_if_declarations.as_mut().unwrap().0;
+
+                            damage = damage |
+                                     self.compute_restyle_damage(Some(old_style),
+                                                                 pseudo_style,
+                                                                 Some(&pseudo));
+                        }
                     }
 
                     // And now, of course, use the new style.
-                    occupied_entry.insert(pseudo_style_if_declarations.unwrap());
+                    occupied_entry.insert(pseudo_style_and_rule_node_if_declarations.unwrap());
                 }
             }
         });
